@@ -1,0 +1,39 @@
+name: Hermes source shuttle
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone exact Hermes main source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/NousResearch/hermes-agent.git hermes-agent
+          cd hermes-agent
+          git sparse-checkout set agent acp_adapter cron gateway hermes_cli plugins scripts tests tools website/docs
+          test "$(git rev-parse HEAD)" = "a991dfc25daf68994c21d6adcdfbafb1b3dc23cf"
+          git status --short
+      - name: Package checkout including git metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf hermes-agent-a991dfc.tar.gz hermes-agent
+          sha256sum hermes-agent-a991dfc.tar.gz > hermes-agent-a991dfc.tar.gz.sha256
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-agent-a991dfc-source
+          path: |
+            hermes-agent-a991dfc.tar.gz
+            hermes-agent-a991dfc.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 1
