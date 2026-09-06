@@ -26,14 +26,12 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: |
-          pip install --disable-pip-version-check beautifulsoup4 playwright
-          python -m playwright install --with-deps chromium
+        run: pip install --disable-pip-version-check requests beautifulsoup4
 
       - name: Scrape current Canadian catalogue
         env:
           SCRAPE_WORKERS: '12'
-        run: xvfb-run -a python scripts/netflix_ca_rt_scrape.py
+        run: python scripts/netflix_ca_rt_scrape.py
 
       - name: Commit result files to temporary branch
         run: |
