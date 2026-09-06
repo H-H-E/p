@@ -1,0 +1,9 @@
+{
+  "generated_at": "2026-09-06T06:44:25.034954+00:00",
+  "method": "Bing search-index reconstruction; origin is Cloudflare-blocked from datacenter runners",
+  "query_rule": "NewOnNetflix /info pages indexed with exact Rotten Tomatoes score 81-100 and availability phrase",
+  "guaranteed_complete": false,
+  "matched_indexed_pages": 0,
+  "conflicts": [],
+  "results": []
+}
