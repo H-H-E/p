@@ -1,285 +1,193 @@
 #!/usr/bin/env python3
+import base64
 import csv
 import json
-import math
 import os
 import random
 import re
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 BASE = "https://can.newonnetflix.info"
-CATALOGUE = f"{BASE}/catalogue"
-WORKERS = int(os.environ.get("SCRAPE_WORKERS", "12"))
-TIMEOUT = 40
-MAX_RETRIES = 7
-PAGE_SIZE = 120
 OUT = Path("results")
 OUT.mkdir(exist_ok=True)
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
-_tls = threading.local()
+SCORES = range(81, 101)
+VARIANTS = ["", "movie", "series", "documentary"]
+MAX_PAGES = 8
+COUNT = 50
+
+s = requests.Session()
+s.headers.update({
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-CA,en;q=0.9",
+})
 
 
-def translate_proxy(url):
-    """Fetch through Google Translate so Google, rather than the runner IP, hits origin."""
-    p = urlparse(url)
-    # Google Translate host encoding: dots -> hyphens, literal hyphens doubled.
-    host = p.netloc.replace("-", "--").replace(".", "-") + ".translate.goog"
-    q = list(parse_qsl(p.query, keep_blank_values=True))
-    q.extend([("_x_tr_sl", "auto"), ("_x_tr_tl", "en"), ("_x_tr_hl", "en")])
-    return urlunparse(("https", host, p.path, p.params, urlencode(q), ""))
+def fetch(url, retries=5):
+    for attempt in range(retries + 1):
+        try:
+            r = s.get(url, timeout=35)
+            if r.status_code == 200:
+                return r.text
+            if r.status_code not in {403, 429, 500, 502, 503, 504}:
+                raise RuntimeError(f"HTTP {r.status_code}: {url}")
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+        if attempt == retries:
+            raise RuntimeError(f"HTTP {getattr(r, 'status_code', '?')}: {url}")
+        wait = min(15, 0.7 * (2 ** attempt)) + random.random()
+        print(f"retry {attempt+1}/{retries} in {wait:.1f}s: {url}", flush=True)
+        time.sleep(wait)
 
 
-def session():
-    s = getattr(_tls, "session", None)
-    if s is None:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-CA,en;q=0.9",
-            "Connection": "keep-alive",
-        })
-        _tls.session = s
-    return s
-
-
-def fetch(url, attempt=0):
-    target = translate_proxy(url)
+def decode_bing_href(href):
+    if not href:
+        return None
+    if href.startswith("https://can.newonnetflix.info/info/"):
+        return href
     try:
-        r = session().get(target, timeout=TIMEOUT)
-    except requests.RequestException as exc:
-        if attempt >= MAX_RETRIES:
-            raise
-        wait = min(20, 0.6 * (2 ** attempt)) + random.random() * 0.5
-        print(f"network retry {attempt+1}/{MAX_RETRIES} {url} in {wait:.1f}s: {exc!r}", flush=True)
-        time.sleep(wait)
-        return fetch(url, attempt + 1)
-
-    text = r.text
-    if r.status_code == 200 and "Performing security verification" not in text and "Just a moment" not in text:
-        return text
-
-    if r.status_code in {403, 408, 429, 500, 502, 503, 504} and attempt < MAX_RETRIES:
-        wait = min(30, 0.8 * (2 ** attempt)) + random.random() * 0.8
-        print(f"HTTP retry {attempt+1}/{MAX_RETRIES}: {r.status_code} {url} in {wait:.1f}s", flush=True)
-        time.sleep(wait)
-        return fetch(url, attempt + 1)
-
-    raise RuntimeError(
-        f"HTTP {r.status_code} for proxy {target}; content-type={r.headers.get('content-type')}; body={text[:300]!r}"
-    )
+        p = urlparse(href)
+        q = parse_qs(p.query)
+        u = q.get("u", [None])[0]
+        if u and u.startswith("a1"):
+            raw = u[2:]
+            raw += "=" * (-len(raw) % 4)
+            decoded = base64.urlsafe_b64decode(raw).decode("utf-8", "ignore")
+            if decoded.startswith("https://can.newonnetflix.info/info/"):
+                return decoded
+    except Exception:
+        pass
+    return None
 
 
-def parse_title(text):
+def clean_title(text):
     text = re.sub(r"\s+", " ", text or "").strip()
-    m = re.match(r"^(.*) \((\d{4})\)$", text)
-    if m:
-        return m.group(1).strip(), int(m.group(2))
-    return text, None
+    patterns = [
+        r"^Is ['\"](.+?)['\"] on Netflix in Canada\?",
+        r"^Everything you need to know about ['\"](.+?)['\"] on Netflix in Canada!?",
+        r"^Is ['\"](.+?)['\"] on Netflix",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.I)
+        if m:
+            return m.group(1).strip()
+    text = re.sub(r"\s*[-–|]\s*New On Netflix Canada.*$", "", text, flags=re.I)
+    return text.strip()
 
 
-def extract_titles(html):
+def search_page(score, variant, first):
+    phrase = f'site:can.newonnetflix.info/info/ "Rotten Tomatoes rating {score}%" "available on Netflix in Canada"'
+    if variant:
+        phrase += f' "{variant}"'
+    url = (
+        "https://www.bing.com/search?q=" + quote_plus(phrase) +
+        f"&count={COUNT}&first={first}&setlang=en-CA&cc=ca&FORM=PERE"
+    )
+    html = fetch(url)
     soup = BeautifulSoup(html, "html.parser")
-    out = {}
-    for a in soup.select('a[href*="/info/"]'):
-        href = a.get("href", "")
-        m = re.search(r"/info/(\d+)(?:[/?#]|$)", href)
+    out = []
+    for li in soup.select("li.b_algo"):
+        a = li.select_one("h2 a")
+        if not a:
+            continue
+        href = decode_bing_href(a.get("href", ""))
+        if not href:
+            continue
+        m = re.search(r"/info/(\d+)", href)
         if not m:
             continue
-        text = a.get_text(" ", strip=True)
-        if not text:
-            img = a.find("img")
-            text = (img.get("alt") or "").strip() if img else ""
-        if not text or text.lower() in {"image", "login or register to subscribe!"}:
-            continue
-        title, year = parse_title(text)
-        if not title:
-            continue
-        nid = m.group(1)
-        old = out.get(nid)
-        row = {"netflix_id": nid, "title": title, "year": year, "url": f"{BASE}/info/{nid}"}
-        if old is None or (old.get("year") is None and year is not None):
-            out[nid] = row
-    return list(out.values())
-
-
-def section_urls(root_html):
-    soup = BeautifulSoup(root_html, "html.parser")
-    paths = {"/catalogue"}
-    for a in soup.select('a[href*="/catalogue/a2z/all/"]'):
-        href = a.get("href", "")
-        m = re.search(r"(/catalogue/a2z/all/[^/?#]+)", href)
-        if m:
-            paths.add(m.group(1))
-    return sorted(urljoin(BASE, path) for path in paths)
-
-
-def title_count(html):
-    # Google Translate may introduce harmless whitespace/span tags, so parse text.
-    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-    m = re.search(r"\[(\d+)\s+titles(?:\s+from\s+this\s+year)?\]", text, re.I)
-    if not m:
-        m = re.search(r"(\d+)\s+titles\s*-\s*Showing", text, re.I)
-    return int(m.group(1)) if m else None
-
-
-def enumerate_catalogue():
-    print(f"probe: {translate_proxy(CATALOGUE)}", flush=True)
-    root = fetch(CATALOGUE)
-    print(f"proxy root fetched: {len(root):,} bytes", flush=True)
-    sections = section_urls(root)
-    print(f"catalogue sections: {len(sections)}", flush=True)
-    titles = {}
-
-    for idx, base_url in enumerate(sections, 1):
-        first_html = root if base_url == CATALOGUE else fetch(base_url)
-        count = title_count(first_html)
-        if count is None:
-            # Fallback: follow fixed pagination until a short/empty page.
-            page = 0
-            while True:
-                html = first_html if page == 0 else fetch(f"{base_url}?start={page * PAGE_SIZE}")
-                rows = extract_titles(html)
-                before = len(titles)
-                for row in rows:
-                    old = titles.get(row["netflix_id"])
-                    if old is None or (old.get("year") is None and row.get("year") is not None):
-                        titles[row["netflix_id"]] = row
-                if page > 0 and (not rows or len(rows) < PAGE_SIZE // 2 or len(titles) == before):
-                    break
-                page += 1
-                if page > 20:
-                    raise RuntimeError(f"Pagination runaway for {base_url}")
-        else:
-            pages = max(1, math.ceil(count / PAGE_SIZE))
-            for page in range(pages):
-                html = first_html if page == 0 else fetch(f"{base_url}?start={page * PAGE_SIZE}")
-                for row in extract_titles(html):
-                    old = titles.get(row["netflix_id"])
-                    if old is None or (old.get("year") is None and row.get("year") is not None):
-                        titles[row["netflix_id"]] = row
-        print(f"section {idx}/{len(sections)} count={count} -> {len(titles)} unique", flush=True)
-
-    return sorted(titles.values(), key=lambda x: (x["title"].casefold(), x.get("year") or 0, x["netflix_id"]))
-
-
-def parse_rt(html):
-    # Alt attributes normally survive Google Translate unchanged. Add text fallback.
-    m = re.search(r"Rotten Tomatoes rating\s*(\d{1,3})%", html, re.I)
-    if not m:
-        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-        m = re.search(r"Rotten Tomatoes(?:\s+rating)?\s*(\d{1,3})%", text, re.I)
-    if not m:
-        return None
-    v = int(m.group(1))
-    return v if 0 <= v <= 100 else None
-
-
-def scrape_one(row):
-    html = fetch(row["url"])
-    return row["netflix_id"], parse_rt(html)
-
-
-def write_outputs(catalogue, score_map, failures):
-    generated = datetime.now(timezone.utc).isoformat()
-    all_rows = []
-    for row in catalogue:
-        r = dict(row)
-        r["rotten_tomatoes"] = score_map.get(row["netflix_id"])
-        all_rows.append(r)
-
-    hits = [r for r in all_rows if isinstance(r["rotten_tomatoes"], int) and r["rotten_tomatoes"] > 80]
-    hits.sort(key=lambda r: (-r["rotten_tomatoes"], r["title"].casefold(), -(r.get("year") or 0), r["netflix_id"]))
-    for i, r in enumerate(hits, 1):
-        r["rank"] = i
-
-    with (OUT / "netflix_canada_rt_over_80.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["rank", "title", "year", "rotten_tomatoes", "netflix_id", "url"])
-        w.writeheader(); w.writerows(hits)
-
-    (OUT / "netflix_canada_rt_over_80.json").write_text(json.dumps({
-        "generated_at": generated,
-        "source": CATALOGUE,
-        "fetch_transport": "Google Translate proxy",
-        "filter": "Rotten Tomatoes > 80%",
-        "catalogue_count": len(catalogue),
-        "rt_scored_count": sum(isinstance(v, int) for v in score_map.values()),
-        "matched_count": len(hits),
-        "failed_detail_requests": failures,
-        "results": hits,
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    with (OUT / "all_catalogue_rt_scores.csv").open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["title", "year", "rotten_tomatoes", "netflix_id", "url"])
-        w.writeheader(); w.writerows(all_rows)
-
-    (OUT / "summary.json").write_text(json.dumps({
-        "generated_at": generated,
-        "catalogue_count": len(catalogue),
-        "rt_scored_count": sum(isinstance(v, int) for v in score_map.values()),
-        "over_80_count": len(hits),
-        "failed_detail_requests": len(failures),
-        "workers": WORKERS,
-    }, indent=2), encoding="utf-8")
-    return hits
+        title = clean_title(a.get_text(" ", strip=True))
+        snippet = li.get_text(" ", strip=True)
+        out.append({
+            "netflix_id": m.group(1),
+            "title": title,
+            "rotten_tomatoes": score,
+            "url": f"{BASE}/info/{m.group(1)}",
+            "bing_snippet": snippet[:1000],
+            "query_variant": variant or "base",
+        })
+    return out, html
 
 
 def main():
     started = time.time()
-    catalogue = enumerate_catalogue()
-    print(f"enumerated {len(catalogue)} current titles", flush=True)
-    if len(catalogue) < 8000:
-        raise RuntimeError(f"Catalogue enumeration suspiciously small: {len(catalogue)}")
+    found = {}
+    conflicts = []
+    query_log = []
 
-    score_map = {}
-    failures = []
-    done = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(scrape_one, r): r for r in catalogue}
-        for fut in as_completed(futures):
-            row = futures[fut]
-            try:
-                nid, score = fut.result()
-                score_map[nid] = score
-            except Exception as exc:
-                failures.append({"netflix_id": row["netflix_id"], "title": row["title"], "error": repr(exc)})
-            done += 1
-            if done % 250 == 0 or done == len(catalogue):
-                rt = sum(isinstance(v, int) for v in score_map.values())
-                high = sum(isinstance(v, int) and v > 80 for v in score_map.values())
-                print(f"details {done}/{len(catalogue)} | RT-scored {rt} | >80 {high} | failures {len(failures)}", flush=True)
+    for score in SCORES:
+        before_score = len(found)
+        for variant in VARIANTS:
+            empty_streak = 0
+            variant_new = 0
+            for page in range(MAX_PAGES):
+                first = 1 + page * COUNT
+                rows, html = search_page(score, variant, first)
+                page_new = 0
+                for row in rows:
+                    nid = row["netflix_id"]
+                    old = found.get(nid)
+                    if old and old["rotten_tomatoes"] != score:
+                        conflicts.append({"id": nid, "old": old["rotten_tomatoes"], "new": score, "title": row["title"]})
+                        continue
+                    if not old:
+                        found[nid] = row
+                        page_new += 1
+                        variant_new += 1
+                query_log.append({"score": score, "variant": variant or "base", "page": page+1, "results": len(rows), "new": page_new})
+                print(f"RT {score}% {variant or 'base'} page {page+1}: {len(rows)} results, {page_new} new, total {len(found)}", flush=True)
 
-    if failures:
-        print(f"serial retry for {len(failures)} failures", flush=True)
-        remaining = []
-        rows_by_id = {r["netflix_id"]: r for r in catalogue}
-        for item in failures:
-            row = rows_by_id[item["netflix_id"]]
-            try:
-                nid, score = scrape_one(row)
-                score_map[nid] = score
-            except Exception as exc:
-                item["retry_error"] = repr(exc)
-                remaining.append(item)
-        failures = remaining
+                if not rows or page_new == 0:
+                    empty_streak += 1
+                else:
+                    empty_streak = 0
+                # Search engines generally stop yielding useful new pages quickly.
+                if empty_streak >= 2:
+                    break
+                time.sleep(0.15 + random.random() * 0.15)
 
-    hits = write_outputs(catalogue, score_map, failures)
-    print(
-        f"DONE catalogue={len(catalogue)} rt_scored={sum(isinstance(v,int) for v in score_map.values())} "
-        f"over80={len(hits)} failures={len(failures)} elapsed={time.time()-started:.1f}s",
-        flush=True,
-    )
+        print(f"RT {score}% complete: +{len(found)-before_score} unique pages", flush=True)
+
+    rows = sorted(found.values(), key=lambda r: (-r["rotten_tomatoes"], r["title"].casefold(), r["netflix_id"]))
+    for i, r in enumerate(rows, 1):
+        r["rank"] = i
+
+    generated = datetime.now(timezone.utc).isoformat()
+    with (OUT / "netflix_canada_rt_over_80_search_index.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["rank", "title", "rotten_tomatoes", "netflix_id", "url", "query_variant"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r[k] for k in w.fieldnames})
+
+    (OUT / "netflix_canada_rt_over_80_search_index.json").write_text(json.dumps({
+        "generated_at": generated,
+        "method": "Bing search-index reconstruction; origin is Cloudflare-blocked from datacenter runners",
+        "query_rule": "NewOnNetflix /info pages indexed with exact Rotten Tomatoes score 81-100 and availability phrase",
+        "guaranteed_complete": False,
+        "matched_indexed_pages": len(rows),
+        "conflicts": conflicts,
+        "results": rows,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    (OUT / "search_query_log.json").write_text(json.dumps(query_log, indent=2), encoding="utf-8")
+    (OUT / "summary.json").write_text(json.dumps({
+        "generated_at": generated,
+        "matched_indexed_pages": len(rows),
+        "conflicts": len(conflicts),
+        "elapsed_seconds": round(time.time() - started, 1),
+    }, indent=2), encoding="utf-8")
+    print(f"DONE indexed_matches={len(rows)} conflicts={len(conflicts)} elapsed={time.time()-started:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
