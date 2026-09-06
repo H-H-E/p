@@ -1,0 +1,54 @@
+name: Temporary Netflix Canada RT scrape
+
+on:
+  push:
+    branches:
+      - tmp-netflix-rt-scrape-20260905
+    paths:
+      - 'scripts/netflix_ca_rt_scrape.py'
+      - '.github/workflows/netflix-rt-scrape.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-netflix-rt-scrape-20260905
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check requests beautifulsoup4
+
+      - name: Scrape current Canadian catalogue
+        env:
+          SCRAPE_WORKERS: '12'
+        run: python scripts/netflix_ca_rt_scrape.py
+
+      - name: Commit result files to temporary branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add results/
+          if git diff --cached --quiet; then
+            echo 'No result changes to commit.'
+          else
+            git commit -m 'Add Netflix Canada RT >80 scrape results [skip ci]'
+            git push origin HEAD:tmp-netflix-rt-scrape-20260905
+          fi
+
+      - name: Upload result artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netflix-canada-rt-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 3
