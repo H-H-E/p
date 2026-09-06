@@ -1,31 +1,84 @@
 #!/usr/bin/env python3
-import asyncio
 import csv
 import json
 import math
 import os
 import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 
 BASE = "https://can.newonnetflix.info"
 CATALOGUE = f"{BASE}/catalogue"
 WORKERS = int(os.environ.get("SCRAPE_WORKERS", "12"))
-PAGE_SIZE = 120
+TIMEOUT = 40
 MAX_RETRIES = 7
+PAGE_SIZE = 120
 OUT = Path("results")
 OUT.mkdir(exist_ok=True)
 UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/152.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
+_tls = threading.local()
+
+
+def translate_proxy(url):
+    """Fetch through Google Translate so Google, rather than the runner IP, hits origin."""
+    p = urlparse(url)
+    # Google Translate host encoding: dots -> hyphens, literal hyphens doubled.
+    host = p.netloc.replace("-", "--").replace(".", "-") + ".translate.goog"
+    q = list(parse_qsl(p.query, keep_blank_values=True))
+    q.extend([("_x_tr_sl", "auto"), ("_x_tr_tl", "en"), ("_x_tr_hl", "en")])
+    return urlunparse(("https", host, p.path, p.params, urlencode(q), ""))
+
+
+def session():
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-CA,en;q=0.9",
+            "Connection": "keep-alive",
+        })
+        _tls.session = s
+    return s
+
+
+def fetch(url, attempt=0):
+    target = translate_proxy(url)
+    try:
+        r = session().get(target, timeout=TIMEOUT)
+    except requests.RequestException as exc:
+        if attempt >= MAX_RETRIES:
+            raise
+        wait = min(20, 0.6 * (2 ** attempt)) + random.random() * 0.5
+        print(f"network retry {attempt+1}/{MAX_RETRIES} {url} in {wait:.1f}s: {exc!r}", flush=True)
+        time.sleep(wait)
+        return fetch(url, attempt + 1)
+
+    text = r.text
+    if r.status_code == 200 and "Performing security verification" not in text and "Just a moment" not in text:
+        return text
+
+    if r.status_code in {403, 408, 429, 500, 502, 503, 504} and attempt < MAX_RETRIES:
+        wait = min(30, 0.8 * (2 ** attempt)) + random.random() * 0.8
+        print(f"HTTP retry {attempt+1}/{MAX_RETRIES}: {r.status_code} {url} in {wait:.1f}s", flush=True)
+        time.sleep(wait)
+        return fetch(url, attempt + 1)
+
+    raise RuntimeError(
+        f"HTTP {r.status_code} for proxy {target}; content-type={r.headers.get('content-type')}; body={text[:300]!r}"
+    )
 
 
 def parse_title(text):
@@ -40,7 +93,7 @@ def extract_titles(html):
     soup = BeautifulSoup(html, "html.parser")
     out = {}
     for a in soup.select('a[href*="/info/"]'):
-        href = urljoin(BASE, a.get("href", ""))
+        href = a.get("href", "")
         m = re.search(r"/info/(\d+)(?:[/?#]|$)", href)
         if not m:
             continue
@@ -55,170 +108,87 @@ def extract_titles(html):
             continue
         nid = m.group(1)
         old = out.get(nid)
+        row = {"netflix_id": nid, "title": title, "year": year, "url": f"{BASE}/info/{nid}"}
         if old is None or (old.get("year") is None and year is not None):
-            out[nid] = {
-                "netflix_id": nid,
-                "title": title,
-                "year": year,
-                "url": f"{BASE}/info/{nid}",
-            }
+            out[nid] = row
     return list(out.values())
 
 
 def section_urls(root_html):
     soup = BeautifulSoup(root_html, "html.parser")
-    urls = {CATALOGUE}
+    paths = {"/catalogue"}
     for a in soup.select('a[href*="/catalogue/a2z/all/"]'):
-        href = urljoin(BASE, a.get("href", ""))
-        p = urlparse(href)
-        urls.add(f"{p.scheme}://{p.netloc}{p.path}")
-    return sorted(urls)
+        href = a.get("href", "")
+        m = re.search(r"(/catalogue/a2z/all/[^/?#]+)", href)
+        if m:
+            paths.add(m.group(1))
+    return sorted(urljoin(BASE, path) for path in paths)
 
 
 def title_count(html):
-    m = re.search(r"\[(\d+)\s+titles(?:\s+from\s+this\s+year)?\]", html, re.I)
+    # Google Translate may introduce harmless whitespace/span tags, so parse text.
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    m = re.search(r"\[(\d+)\s+titles(?:\s+from\s+this\s+year)?\]", text, re.I)
+    if not m:
+        m = re.search(r"(\d+)\s+titles\s*-\s*Showing", text, re.I)
     return int(m.group(1)) if m else None
 
 
-def parse_rt(html):
-    m = re.search(r"Rotten Tomatoes rating\s*(\d{1,3})%", html, re.I)
-    if not m:
-        return None
-    score = int(m.group(1))
-    return score if 0 <= score <= 100 else None
-
-
-class BrowserFetcher:
-    def __init__(self, context, request):
-        self.context = context
-        self.request = request
-        self.sem = asyncio.Semaphore(WORKERS)
-
-    async def get(self, url, attempt=0):
-        async with self.sem:
-            try:
-                r = await self.request.get(
-                    url,
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-CA,en;q=0.9",
-                        "Referer": CATALOGUE,
-                    },
-                    timeout=45000,
-                )
-                status = r.status
-                text = await r.text()
-            except Exception as exc:
-                if attempt >= MAX_RETRIES:
-                    raise
-                delay = min(20, 0.7 * (2 ** attempt)) + random.random() * 0.5
-                print(f"network retry {attempt+1}/{MAX_RETRIES}: {url} in {delay:.1f}s ({exc!r})", flush=True)
-                await asyncio.sleep(delay)
-                return await self.get(url, attempt + 1)
-
-        if status == 200 and "Please wait while your request is being verified" not in text:
-            return text
-
-        if status in {403, 429, 500, 502, 503, 504} and attempt < MAX_RETRIES:
-            delay = min(25, 0.8 * (2 ** attempt)) + random.random() * 0.8
-            print(f"HTTP retry {attempt+1}/{MAX_RETRIES}: {status} {url} in {delay:.1f}s", flush=True)
-            await asyncio.sleep(delay)
-            return await self.get(url, attempt + 1)
-
-        raise RuntimeError(f"HTTP {status} for {url}; body={text[:160]!r}")
-
-
-async def bootstrap_browser(pw):
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    )
-    context = await browser.new_context(
-        user_agent=UA,
-        locale="en-CA",
-        timezone_id="America/Vancouver",
-        viewport={"width": 1365, "height": 900},
-        java_script_enabled=True,
-    )
-    await context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-    )
-    page = await context.new_page()
-    print("opening catalogue in Chromium to establish browser session...", flush=True)
-    response = await page.goto(CATALOGUE, wait_until="domcontentloaded", timeout=90000)
-    print(f"initial browser status={response.status if response else None} title={await page.title()!r}", flush=True)
-
-    solved = False
-    for i in range(45):
-        body = await page.content()
-        if "Full Catalogue" in body and "Please wait while your request is being verified" not in body:
-            solved = True
-            break
-        await page.wait_for_timeout(1000)
-
-    if not solved:
-        body_text = (await page.locator("body").inner_text())[:800]
-        raise RuntimeError(f"Browser challenge did not clear. body={body_text!r}")
-
-    cookies = await context.cookies()
-    print("browser session established; cookies=" + ",".join(sorted(c["name"] for c in cookies)), flush=True)
-    root_html = await page.content()
-    return browser, context, root_html
-
-
-async def enumerate_catalogue(fetcher, root_html):
-    sections = section_urls(root_html)
+def enumerate_catalogue():
+    print(f"probe: {translate_proxy(CATALOGUE)}", flush=True)
+    root = fetch(CATALOGUE)
+    print(f"proxy root fetched: {len(root):,} bytes", flush=True)
+    sections = section_urls(root)
     print(f"catalogue sections: {len(sections)}", flush=True)
     titles = {}
 
     for idx, base_url in enumerate(sections, 1):
-        first_html = root_html if base_url == CATALOGUE else await fetcher.get(base_url)
+        first_html = root if base_url == CATALOGUE else fetch(base_url)
         count = title_count(first_html)
-        pages = 1 if not count else max(1, math.ceil(count / PAGE_SIZE))
-
-        html_pages = [first_html]
-        if pages > 1:
-            urls = [f"{base_url}?start={p * PAGE_SIZE}" for p in range(1, pages)]
-            html_pages += await asyncio.gather(*(fetcher.get(u) for u in urls))
-
-        for html in html_pages:
-            for row in extract_titles(html):
-                nid = row["netflix_id"]
-                old = titles.get(nid)
-                if old is None or (old.get("year") is None and row.get("year") is not None):
-                    titles[nid] = row
-        print(f"section {idx}/{len(sections)} -> {len(titles)} unique titles", flush=True)
+        if count is None:
+            # Fallback: follow fixed pagination until a short/empty page.
+            page = 0
+            while True:
+                html = first_html if page == 0 else fetch(f"{base_url}?start={page * PAGE_SIZE}")
+                rows = extract_titles(html)
+                before = len(titles)
+                for row in rows:
+                    old = titles.get(row["netflix_id"])
+                    if old is None or (old.get("year") is None and row.get("year") is not None):
+                        titles[row["netflix_id"]] = row
+                if page > 0 and (not rows or len(rows) < PAGE_SIZE // 2 or len(titles) == before):
+                    break
+                page += 1
+                if page > 20:
+                    raise RuntimeError(f"Pagination runaway for {base_url}")
+        else:
+            pages = max(1, math.ceil(count / PAGE_SIZE))
+            for page in range(pages):
+                html = first_html if page == 0 else fetch(f"{base_url}?start={page * PAGE_SIZE}")
+                for row in extract_titles(html):
+                    old = titles.get(row["netflix_id"])
+                    if old is None or (old.get("year") is None and row.get("year") is not None):
+                        titles[row["netflix_id"]] = row
+        print(f"section {idx}/{len(sections)} count={count} -> {len(titles)} unique", flush=True)
 
     return sorted(titles.values(), key=lambda x: (x["title"].casefold(), x.get("year") or 0, x["netflix_id"]))
 
 
-async def scrape_scores(fetcher, catalogue):
-    score_map = {}
-    failures = []
-    completed = 0
+def parse_rt(html):
+    # Alt attributes normally survive Google Translate unchanged. Add text fallback.
+    m = re.search(r"Rotten Tomatoes rating\s*(\d{1,3})%", html, re.I)
+    if not m:
+        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+        m = re.search(r"Rotten Tomatoes(?:\s+rating)?\s*(\d{1,3})%", text, re.I)
+    if not m:
+        return None
+    v = int(m.group(1))
+    return v if 0 <= v <= 100 else None
 
-    async def one(row):
-        html = await fetcher.get(row["url"])
-        return row, parse_rt(html)
 
-    tasks = [asyncio.create_task(one(r)) for r in catalogue]
-    for task in asyncio.as_completed(tasks):
-        completed += 1
-        try:
-            row, score = await task
-            score_map[row["netflix_id"]] = score
-        except Exception as exc:
-            failures.append(repr(exc))
-        if completed % 250 == 0 or completed == len(catalogue):
-            rt_scored = sum(isinstance(v, int) for v in score_map.values())
-            hits = sum(isinstance(v, int) and v > 80 for v in score_map.values())
-            print(f"details {completed}/{len(catalogue)} | RT-scored {rt_scored} | >80 {hits} | failures {len(failures)}", flush=True)
-
-    return score_map, failures
+def scrape_one(row):
+    html = fetch(row["url"])
+    return row["netflix_id"], parse_rt(html)
 
 
 def write_outputs(catalogue, score_map, failures):
@@ -241,9 +211,10 @@ def write_outputs(catalogue, score_map, failures):
     (OUT / "netflix_canada_rt_over_80.json").write_text(json.dumps({
         "generated_at": generated,
         "source": CATALOGUE,
+        "fetch_transport": "Google Translate proxy",
         "filter": "Rotten Tomatoes > 80%",
         "catalogue_count": len(catalogue),
-        "detail_pages_with_rt_score": sum(isinstance(v, int) for v in score_map.values()),
+        "rt_scored_count": sum(isinstance(v, int) for v in score_map.values()),
         "matched_count": len(hits),
         "failed_detail_requests": failures,
         "results": hits,
@@ -264,36 +235,52 @@ def write_outputs(catalogue, score_map, failures):
     return hits
 
 
-async def main():
+def main():
     started = time.time()
-    async with async_playwright() as pw:
-        browser, context, root_html = await bootstrap_browser(pw)
-        try:
-            fetcher = BrowserFetcher(context, context.request)
-            # Confirm the shared browser request context can fetch after challenge clearance.
-            probe = await fetcher.get(CATALOGUE)
-            if "Full Catalogue" not in probe:
-                raise RuntimeError("Browser API request context did not retain catalogue access")
-            print("shared browser request context verified", flush=True)
+    catalogue = enumerate_catalogue()
+    print(f"enumerated {len(catalogue)} current titles", flush=True)
+    if len(catalogue) < 8000:
+        raise RuntimeError(f"Catalogue enumeration suspiciously small: {len(catalogue)}")
 
-            catalogue = await enumerate_catalogue(fetcher, root_html)
-            print(f"enumerated {len(catalogue)} current titles", flush=True)
-            if len(catalogue) < 8000:
-                raise RuntimeError(f"Catalogue enumeration suspiciously small: {len(catalogue)}")
+    score_map = {}
+    failures = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(scrape_one, r): r for r in catalogue}
+        for fut in as_completed(futures):
+            row = futures[fut]
+            try:
+                nid, score = fut.result()
+                score_map[nid] = score
+            except Exception as exc:
+                failures.append({"netflix_id": row["netflix_id"], "title": row["title"], "error": repr(exc)})
+            done += 1
+            if done % 250 == 0 or done == len(catalogue):
+                rt = sum(isinstance(v, int) for v in score_map.values())
+                high = sum(isinstance(v, int) and v > 80 for v in score_map.values())
+                print(f"details {done}/{len(catalogue)} | RT-scored {rt} | >80 {high} | failures {len(failures)}", flush=True)
 
-            score_map, failures = await scrape_scores(fetcher, catalogue)
-            hits = write_outputs(catalogue, score_map, failures)
-            elapsed = time.time() - started
-            print(
-                f"DONE catalogue={len(catalogue)} rt_scored={sum(isinstance(v,int) for v in score_map.values())} "
-                f"over80={len(hits)} failures={len(failures)} elapsed={elapsed:.1f}s",
-                flush=True,
-            )
-            known = {r["title"]: r["rotten_tomatoes"] for r in hits}
-            print(f"sanity Breaking Bad={known.get('Breaking Bad')}", flush=True)
-        finally:
-            await browser.close()
+    if failures:
+        print(f"serial retry for {len(failures)} failures", flush=True)
+        remaining = []
+        rows_by_id = {r["netflix_id"]: r for r in catalogue}
+        for item in failures:
+            row = rows_by_id[item["netflix_id"]]
+            try:
+                nid, score = scrape_one(row)
+                score_map[nid] = score
+            except Exception as exc:
+                item["retry_error"] = repr(exc)
+                remaining.append(item)
+        failures = remaining
+
+    hits = write_outputs(catalogue, score_map, failures)
+    print(
+        f"DONE catalogue={len(catalogue)} rt_scored={sum(isinstance(v,int) for v in score_map.values())} "
+        f"over80={len(hits)} failures={len(failures)} elapsed={time.time()-started:.1f}s",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
